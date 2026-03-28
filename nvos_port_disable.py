@@ -549,16 +549,22 @@ def print_report(results: list[PortResult]) -> None:
     success_count = sum(1 for r in results if r.result == "SUCCESS")
     failed_count = sum(1 for r in results if r.result == "FAILED")
     skipped_count = sum(1 for r in results if r.result == "SKIPPED")
+    dry_count = sum(1 for r in results if r.result == "DRY_RUN")
     unique_switches = len(set(r.switch_ip for r in results))
 
     print("\n" + "=" * len(header))
     print("NVOS PORT DISABLE REPORT")
     print(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Switches: {unique_switches}  |  "
-          f"Total Ports: {len(results)}  |  "
-          f"Success: {success_count}  |  "
-          f"Failed: {failed_count}  |  "
-          f"Skipped: {skipped_count}")
+    summary = (
+        f"Switches: {unique_switches}  |  "
+        f"Total rows: {len(results)}  |  "
+        f"Success: {success_count}  |  "
+        f"Failed: {failed_count}  |  "
+        f"Skipped: {skipped_count}"
+    )
+    if dry_count:
+        summary += f"  |  Dry run: {dry_count}"
+    print(summary)
     print("=" * len(header))
     print(header)
     print(separator)
@@ -604,6 +610,54 @@ def save_csv(results: list[PortResult], filepath: str) -> None:
                     "error": r.error,
                 }
             )
+
+
+def build_dry_run_results(
+    targets: dict[str, list[str]],
+    *,
+    save_only: bool,
+    save_config: bool,
+) -> list[PortResult]:
+    """Synthetic rows for CSV/console report when no API calls are made."""
+    results: list[PortResult] = []
+    note = "Dry run; not executed"
+    if save_only:
+        for ip in sorted(targets):
+            results.append(
+                PortResult(
+                    switch_ip=ip,
+                    port="*",
+                    previous_state="n/a",
+                    action="save",
+                    result="DRY_RUN",
+                    error=note,
+                )
+            )
+        return results
+    for ip, ports in sorted(targets.items()):
+        for port in sorted(ports):
+            results.append(
+                PortResult(
+                    switch_ip=ip,
+                    port=port,
+                    previous_state="unknown",
+                    action="disable",
+                    result="DRY_RUN",
+                    error=note,
+                )
+            )
+        if save_config and ports:
+            results.append(
+                PortResult(
+                    switch_ip=ip,
+                    port="*",
+                    previous_state="n/a",
+                    action="save",
+                    result="DRY_RUN",
+                    error=note,
+                )
+            )
+    return results
 
 
 def main():
@@ -762,21 +816,16 @@ Examples:
     print()
 
     if args.dry_run:
-        if args.save_only:
-            print("[DRY RUN] Would save applied configuration to startup on:")
-            for ip in sorted(targets):
-                print(f"  {ip}")
-        else:
-            print("[DRY RUN] Would disable the following ports:")
-            for ip, ports in sorted(targets.items()):
-                for port in sorted(ports):
-                    print(f"  {ip} -> {port}")
-            if args.save_config:
-                print(
-                    "\n[DRY RUN] Would save applied configuration to startup on each "
-                    "switch that had at least one successful disable."
-                )
-        print("\nNo changes made.")
+        dry_results = build_dry_run_results(
+            targets, save_only=args.save_only, save_config=args.save_config
+        )
+        print("[DRY RUN] No changes will be made on switches.\n")
+        print_report(dry_results)
+        output_file = args.output or (
+            f"port_disable_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        )
+        save_csv(dry_results, output_file)
+        print(f"Report saved to: {output_file}")
         sys.exit(0)
 
     all_results: list[PortResult] = []
