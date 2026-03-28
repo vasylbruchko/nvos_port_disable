@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-NVOS InfiniBand Fabric Port Disable Tool
+NVOS InfiniBand Fabric Port Link Tool
 
-Disables specified ports on NVOS InfiniBand switches via the NVUE REST API.
+Enables or disables specified ports on NVOS InfiniBand switches via the NVUE REST API.
 Produces a final report printed to the console and saved as a CSV file.
 """
 
@@ -131,8 +131,16 @@ class NVUEClient:
         r = self._patch("/revision/applied", payload)
         r.raise_for_status()
 
-    def disable_ports(self, ports: list[str]) -> list[PortResult]:
-        """Disable a list of ports on this switch. Returns per-port results."""
+    def set_port_link_states(self, ports: list[str], desired: str) -> list[PortResult]:
+        """
+        Set link state for a list of ports. desired is 'up' (enable) or 'down' (disable).
+        Returns per-port results; action column is 'enable' or 'disable' for API attempts.
+        """
+        if desired not in ("up", "down"):
+            raise ValueError("desired must be 'up' or 'down'")
+        action = "enable" if desired == "up" else "disable"
+        skip_msg = "Port already up" if desired == "up" else "Port already down"
+
         results: list[PortResult] = []
         hostname = self.get_hostname()
         label = f"{hostname} ({self.ip})" if hostname != self.ip else self.ip
@@ -155,15 +163,15 @@ class NVUEClient:
                         error=f"Interface {port_name} does not exist on {label}",
                     )
                 )
-            elif prev == "down":
+            elif prev == desired:
                 results.append(
                     PortResult(
                         switch_ip=self.ip,
                         port=port_name,
-                        previous_state="down",
+                        previous_state=prev,
                         action="none",
                         result="SKIPPED",
-                        error="Port already down",
+                        error=skip_msg,
                     )
                 )
             else:
@@ -181,7 +189,7 @@ class NVUEClient:
                         switch_ip=self.ip,
                         port=port_name,
                         previous_state=pre_states[port_name],
-                        action="disable",
+                        action=action,
                         result="FAILED",
                         error=f"Failed to create revision on {label}: {e}",
                     )
@@ -190,7 +198,7 @@ class NVUEClient:
 
         try:
             patch_payload = {
-                p: {"link": {"state": "down"}} for p in valid_ports
+                p: {"link": {"state": desired}} for p in valid_ports
             }
             r = self._patch(
                 "/interface", patch_payload, params={"rev": changeset}
@@ -203,7 +211,7 @@ class NVUEClient:
                         switch_ip=self.ip,
                         port=port_name,
                         previous_state=pre_states[port_name],
-                        action="disable",
+                        action=action,
                         result="FAILED",
                         error=f"Failed to patch interface config on {label}: {e}",
                     )
@@ -220,7 +228,7 @@ class NVUEClient:
                         switch_ip=self.ip,
                         port=port_name,
                         previous_state=pre_states[port_name],
-                        action="disable",
+                        action=action,
                         result="FAILED",
                         error=f"Failed to apply revision on {label}: {e}",
                     )
@@ -234,7 +242,7 @@ class NVUEClient:
                         switch_ip=self.ip,
                         port=port_name,
                         previous_state=pre_states[port_name],
-                        action="disable",
+                        action=action,
                         result="FAILED",
                         error=f"Revision apply timed out or failed on {label}",
                     )
@@ -243,13 +251,13 @@ class NVUEClient:
 
         for port_name in valid_ports:
             post_state = self.get_port_state(port_name)
-            if post_state == "down":
+            if post_state == desired:
                 results.append(
                     PortResult(
                         switch_ip=self.ip,
                         port=port_name,
                         previous_state=pre_states[port_name],
-                        action="disable",
+                        action=action,
                         result="SUCCESS",
                         error="",
                     )
@@ -260,9 +268,9 @@ class NVUEClient:
                         switch_ip=self.ip,
                         port=port_name,
                         previous_state=pre_states[port_name],
-                        action="disable",
+                        action=action,
                         result="FAILED",
-                        error=f"Post-apply state is '{post_state}', expected 'down'",
+                        error=f"Post-apply state is '{post_state}', expected '{desired}'",
                     )
                 )
 
@@ -426,13 +434,17 @@ def process_switch(
     password: str,
     api_port: int,
     save_config: bool = False,
+    enable: bool = False,
 ) -> list[PortResult]:
-    """Process all port disables for a single switch."""
+    """Process all port enable or disable operations for a single switch."""
+    desired = "up" if enable else "down"
+    port_action = "enable" if enable else "disable"
     try:
         client = NVUEClient(ip, username, password, port=api_port)
-        results = client.disable_ports(ports)
+        results = client.set_port_link_states(ports, desired)
         if save_config and any(
-            r.action == "disable" and r.result == "SUCCESS" for r in results
+            r.action in ("disable", "enable") and r.result == "SUCCESS"
+            for r in results
         ):
             try:
                 client.save_applied_config()
@@ -464,7 +476,7 @@ def process_switch(
                 switch_ip=ip,
                 port=p,
                 previous_state="unknown",
-                action="disable",
+                action=port_action,
                 result="FAILED",
                 error=f"Connection refused or unreachable: {ip}",
             )
@@ -476,7 +488,7 @@ def process_switch(
                 switch_ip=ip,
                 port=p,
                 previous_state="unknown",
-                action="disable",
+                action=port_action,
                 result="FAILED",
                 error=str(e),
             )
@@ -525,8 +537,8 @@ def process_switch_save_only(
         ]
 
 
-def print_report(results: list[PortResult]) -> None:
-    """Print a formatted report to the console."""
+def print_report(results: list[PortResult], *, operation: str = "disable") -> None:
+    """Print a formatted report to the console. operation is 'enable' or 'disable' for the title."""
     col_widths = {
         "switch_ip": max(10, max((len(r.switch_ip) for r in results), default=10)),
         "port": max(6, max((len(r.port) for r in results), default=6)),
@@ -553,7 +565,8 @@ def print_report(results: list[PortResult]) -> None:
     unique_switches = len(set(r.switch_ip for r in results))
 
     print("\n" + "=" * len(header))
-    print("NVOS PORT DISABLE REPORT")
+    op = operation.upper()
+    print(f"NVOS PORT REPORT ({op})")
     print(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     summary = (
         f"Switches: {unique_switches}  |  "
@@ -617,6 +630,7 @@ def build_dry_run_results(
     *,
     save_only: bool,
     save_config: bool,
+    enable: bool = False,
 ) -> list[PortResult]:
     """Synthetic rows for CSV/console report when no API calls are made."""
     results: list[PortResult] = []
@@ -634,6 +648,7 @@ def build_dry_run_results(
                 )
             )
         return results
+    port_action = "enable" if enable else "disable"
     for ip, ports in sorted(targets.items()):
         for port in sorted(ports):
             results.append(
@@ -641,7 +656,7 @@ def build_dry_run_results(
                     switch_ip=ip,
                     port=port,
                     previous_state="unknown",
-                    action="disable",
+                    action=port_action,
                     result="DRY_RUN",
                     error=note,
                 )
@@ -662,12 +677,15 @@ def build_dry_run_results(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Disable ports on NVOS InfiniBand switches via NVUE REST API.",
+        description="Enable or disable ports on NVOS InfiniBand switches via NVUE REST API.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
   # Disable ports on a single switch
   %(prog)s -u admin -p password -t 10.0.0.1:sw1p1,sw1p2
+
+  # Enable (bring up) ports on a single switch
+  %(prog)s -u admin -p password -t 10.0.0.1:sw1p1,sw1p2 --enable
 
   # Disable ports on multiple switches
   %(prog)s -u admin -p password -t 10.0.0.1:sw1p1,sw1p2 -t 10.0.0.2:sw3p1
@@ -684,7 +702,7 @@ Examples:
   # Custom output file and API port
   %(prog)s -u admin -p password -t 10.0.0.1:sw1p1 -o report.csv --api-port 8443
 
-  # Save applied config to startup after successful disables (nv config save)
+  # Save applied config to startup after successful port changes (nv config save)
   %(prog)s -u admin -p password -t 10.0.0.1:sw1p1 --save-config
 
   # Two-step: (1) disable only  (2) after checks, save startup config only
@@ -751,8 +769,8 @@ Examples:
     parser.add_argument(
         "--save-config",
         action="store_true",
-        help="After at least one successful port disable on a switch, persist applied "
-        "configuration to startup via PATCH /revision/applied (like nv config save)",
+        help="After at least one successful port enable or disable on a switch, persist "
+        "applied configuration to startup via PATCH /revision/applied (like nv config save)",
     )
     parser.add_argument(
         "--save-only",
@@ -765,8 +783,16 @@ Examples:
         "--save-only (or --save-config-only) and the same switch list (-f targets.json "
         "or repeat -t IP per switch).",
     )
+    parser.add_argument(
+        "--enable",
+        action="store_true",
+        help="Bring ports up (link state up) instead of down. Incompatible with --save-only.",
+    )
 
     args = parser.parse_args()
+
+    if args.enable and args.save_only:
+        parser.error("--enable cannot be used with --save-only/--save-config-only")
 
     if args.save_config and args.save_only:
         parser.error(
@@ -804,23 +830,32 @@ Examples:
         print("ERROR: No ports specified (use IP:port1,port2,... for each --target)")
         sys.exit(1)
 
-    print("\nNVOS Port Disable Tool")
+    print("\nNVOS Port Tool")
     if args.save_only:
         print("Mode: save applied configuration to startup only (--save-only)")
         print(f"Switches: {len(targets)}")
     else:
-        print(f"Switches: {len(targets)}  |  Ports to disable: {total_ports}")
+        op = "enable" if args.enable else "disable"
+        print(f"Switches: {len(targets)}  |  Ports to {op}: {total_ports}")
     print(f"API port: {args.api_port}")
-    if args.save_config:
-        print("Save to startup: yes (after successful disables per switch)")
+    if args.save_config and not args.save_only:
+        print(
+            "Save to startup: yes (after successful port changes per switch)"
+        )
     print()
 
     if args.dry_run:
         dry_results = build_dry_run_results(
-            targets, save_only=args.save_only, save_config=args.save_config
+            targets,
+            save_only=args.save_only,
+            save_config=args.save_config,
+            enable=args.enable,
         )
         print("[DRY RUN] No changes will be made on switches.\n")
-        print_report(dry_results)
+        print_report(
+            dry_results,
+            operation="save" if args.save_only else ("enable" if args.enable else "disable"),
+        )
         output_file = args.output or (
             f"port_disable_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         )
@@ -850,6 +885,7 @@ Examples:
                     *resolve_switch_auth(ip, args.username, password, per_ip_credentials),
                     args.api_port,
                     args.save_config,
+                    args.enable,
                 ): ip
                 for ip, ports in targets.items()
             }
@@ -860,18 +896,26 @@ Examples:
                 results = future.result()
                 all_results.extend(results)
             except Exception as e:
+                port_action = (
+                    "save"
+                    if args.save_only
+                    else ("enable" if args.enable else "disable")
+                )
                 all_results.append(
                     PortResult(
                         switch_ip=ip,
                         port="*",
                         previous_state="unknown",
-                        action="save" if args.save_only else "disable",
+                        action=port_action,
                         result="FAILED",
                         error=str(e),
                     )
                 )
 
-    print_report(all_results)
+    print_report(
+        all_results,
+        operation="save" if args.save_only else ("enable" if args.enable else "disable"),
+    )
 
     output_file = args.output or (
         f"port_disable_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
