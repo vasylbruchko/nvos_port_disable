@@ -125,6 +125,12 @@ class NVUEClient:
             time.sleep(POLL_INTERVAL)
         return False
 
+    def save_applied_config(self) -> None:
+        """Persist applied configuration to startup (REST equivalent of nv config save)."""
+        payload = {"state": "save", "auto-prompt": {"ays": "ays_yes"}}
+        r = self._patch("/revision/applied", payload)
+        r.raise_for_status()
+
     def disable_ports(self, ports: list[str]) -> list[PortResult]:
         """Disable a list of ports on this switch. Returns per-port results."""
         results: list[PortResult] = []
@@ -263,20 +269,36 @@ class NVUEClient:
         return results
 
 
-def parse_targets(target_args: list[str]) -> dict[str, list[str]]:
+def parse_targets(
+    target_args: list[str], *, allow_ip_only: bool = False
+) -> dict[str, list[str]]:
     """
     Parse target arguments in the form 'IP:port1,port2,...'
+    If allow_ip_only is True (for --save-only), 'IP' alone selects that switch with no ports.
     Returns dict mapping IP -> list of port names.
     """
     targets: dict[str, list[str]] = {}
     for entry in target_args:
+        entry = entry.strip()
         if ":" not in entry:
-            print(f"ERROR: Invalid target format '{entry}'. Expected IP:port1,port2,...")
-            sys.exit(1)
+            if not allow_ip_only:
+                print(
+                    f"ERROR: Invalid target format '{entry}'. "
+                    "Expected IP:port1,port2,... (or use --save-only with -t IP)"
+                )
+                sys.exit(1)
+            if not entry:
+                print("ERROR: Empty --target entry")
+                sys.exit(1)
+            targets.setdefault(entry, [])
+            continue
         ip, ports_str = entry.split(":", 1)
         ip = ip.strip()
+        if not ip:
+            print(f"ERROR: Invalid target format '{entry}'")
+            sys.exit(1)
         ports = [p.strip() for p in ports_str.split(",") if p.strip()]
-        if not ports:
+        if not ports and not allow_ip_only:
             print(f"ERROR: No ports specified for {ip}")
             sys.exit(1)
         targets.setdefault(ip, []).extend(ports)
@@ -309,12 +331,44 @@ def load_targets_from_file(filepath: str) -> dict[str, list[str]]:
 
 
 def process_switch(
-    ip: str, ports: list[str], username: str, password: str, api_port: int
+    ip: str,
+    ports: list[str],
+    username: str,
+    password: str,
+    api_port: int,
+    save_config: bool = False,
 ) -> list[PortResult]:
     """Process all port disables for a single switch."""
     try:
         client = NVUEClient(ip, username, password, port=api_port)
-        return client.disable_ports(ports)
+        results = client.disable_ports(ports)
+        if save_config and any(
+            r.action == "disable" and r.result == "SUCCESS" for r in results
+        ):
+            try:
+                client.save_applied_config()
+                results.append(
+                    PortResult(
+                        switch_ip=ip,
+                        port="*",
+                        previous_state="n/a",
+                        action="save",
+                        result="SUCCESS",
+                        error="",
+                    )
+                )
+            except Exception as e:
+                results.append(
+                    PortResult(
+                        switch_ip=ip,
+                        port="*",
+                        previous_state="n/a",
+                        action="save",
+                        result="FAILED",
+                        error=str(e),
+                    )
+                )
+        return results
     except requests.exceptions.ConnectionError:
         return [
             PortResult(
@@ -338,6 +392,47 @@ def process_switch(
                 error=str(e),
             )
             for p in ports
+        ]
+
+
+def process_switch_save_only(
+    ip: str, username: str, password: str, api_port: int
+) -> list[PortResult]:
+    """Persist applied NVUE configuration to startup for one switch (no port changes)."""
+    try:
+        client = NVUEClient(ip, username, password, port=api_port)
+        client.save_applied_config()
+        return [
+            PortResult(
+                switch_ip=ip,
+                port="*",
+                previous_state="n/a",
+                action="save",
+                result="SUCCESS",
+                error="",
+            )
+        ]
+    except requests.exceptions.ConnectionError:
+        return [
+            PortResult(
+                switch_ip=ip,
+                port="*",
+                previous_state="n/a",
+                action="save",
+                result="FAILED",
+                error=f"Connection refused or unreachable: {ip}",
+            )
+        ]
+    except Exception as e:
+        return [
+            PortResult(
+                switch_ip=ip,
+                port="*",
+                previous_state="n/a",
+                action="save",
+                result="FAILED",
+                error=str(e),
+            )
         ]
 
 
@@ -442,6 +537,15 @@ Examples:
 
   # Custom output file and API port
   %(prog)s -u admin -p password -t 10.0.0.1:sw1p1 -o report.csv --api-port 8443
+
+  # Save applied config to startup after successful disables (nv config save)
+  %(prog)s -u admin -p password -t 10.0.0.1:sw1p1 --save-config
+
+  # Two-step: (1) disable only  (2) after checks, save startup config only
+  %(prog)s -u admin -p password -t 10.0.0.1:sw1p1
+  %(prog)s -u admin -p password --save-only -t 10.0.0.1
+  # Same as --save-only:
+  %(prog)s -u admin -p password --save-config-only -f targets.json
 """,
     )
     parser.add_argument(
@@ -456,7 +560,8 @@ Examples:
         action="append",
         default=[],
         metavar="IP:port1,port2",
-        help="Switch target in the format IP:port1,port2,... (repeatable)",
+        help="Switch target: IP:port1,port2,... (repeatable). With --save-only / "
+        "--save-config-only, IP alone is allowed (no port list).",
     )
     parser.add_argument(
         "-f",
@@ -489,8 +594,30 @@ Examples:
         action="store_true",
         help="Show what would be done without making changes",
     )
+    parser.add_argument(
+        "--save-config",
+        action="store_true",
+        help="After at least one successful port disable on a switch, persist applied "
+        "configuration to startup via PATCH /revision/applied (like nv config save)",
+    )
+    parser.add_argument(
+        "--save-only",
+        "--save-config-only",
+        action="store_true",
+        dest="save_only",
+        help="Do not disable ports; only save applied configuration to startup on each "
+        "listed switch (same REST operation as nv config save). For a two-step workflow, "
+        "run a normal disable first (without --save-config), then run again with "
+        "--save-only (or --save-config-only) and the same switch list (-f targets.json "
+        "or repeat -t IP per switch).",
+    )
 
     args = parser.parse_args()
+
+    if args.save_config and args.save_only:
+        parser.error(
+            "--save-config and --save-only/--save-config-only cannot be used together"
+        )
 
     if not args.target and not args.file:
         parser.error("At least one --target or --file is required")
@@ -503,7 +630,9 @@ Examples:
     if args.file:
         targets.update(load_targets_from_file(args.file))
     if args.target:
-        for ip, ports in parse_targets(args.target).items():
+        for ip, ports in parse_targets(
+            args.target, allow_ip_only=args.save_only
+        ).items():
             targets.setdefault(ip, []).extend(ports)
 
     if not targets:
@@ -511,28 +640,66 @@ Examples:
         sys.exit(1)
 
     total_ports = sum(len(p) for p in targets.values())
-    print(f"\nNVOS Port Disable Tool")
-    print(f"Switches: {len(targets)}  |  Ports to disable: {total_ports}")
+    if not args.save_only and total_ports == 0:
+        print("ERROR: No ports specified (use IP:port1,port2,... for each --target)")
+        sys.exit(1)
+
+    print("\nNVOS Port Disable Tool")
+    if args.save_only:
+        print("Mode: save applied configuration to startup only (--save-only)")
+        print(f"Switches: {len(targets)}")
+    else:
+        print(f"Switches: {len(targets)}  |  Ports to disable: {total_ports}")
     print(f"API port: {args.api_port}")
+    if args.save_config:
+        print("Save to startup: yes (after successful disables per switch)")
     print()
 
     if args.dry_run:
-        print("[DRY RUN] Would disable the following ports:")
-        for ip, ports in sorted(targets.items()):
-            for port in sorted(ports):
-                print(f"  {ip} -> {port}")
+        if args.save_only:
+            print("[DRY RUN] Would save applied configuration to startup on:")
+            for ip in sorted(targets):
+                print(f"  {ip}")
+        else:
+            print("[DRY RUN] Would disable the following ports:")
+            for ip, ports in sorted(targets.items()):
+                for port in sorted(ports):
+                    print(f"  {ip} -> {port}")
+            if args.save_config:
+                print(
+                    "\n[DRY RUN] Would save applied configuration to startup on each "
+                    "switch that had at least one successful disable."
+                )
         print("\nNo changes made.")
         sys.exit(0)
 
     all_results: list[PortResult] = []
 
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = {
-            executor.submit(
-                process_switch, ip, ports, args.username, password, args.api_port
-            ): ip
-            for ip, ports in targets.items()
-        }
+        if args.save_only:
+            futures = {
+                executor.submit(
+                    process_switch_save_only,
+                    ip,
+                    args.username,
+                    password,
+                    args.api_port,
+                ): ip
+                for ip in targets
+            }
+        else:
+            futures = {
+                executor.submit(
+                    process_switch,
+                    ip,
+                    ports,
+                    args.username,
+                    password,
+                    args.api_port,
+                    args.save_config,
+                ): ip
+                for ip, ports in targets.items()
+            }
 
         for future in as_completed(futures):
             ip = futures[future]
@@ -545,7 +712,7 @@ Examples:
                         switch_ip=ip,
                         port="*",
                         previous_state="unknown",
-                        action="disable",
+                        action="save" if args.save_only else "disable",
                         result="FAILED",
                         error=str(e),
                     )
