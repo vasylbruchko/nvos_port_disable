@@ -1,0 +1,16 @@
+{
+  "targets": {
+    "203.0.113.10": ["sw37p1", "sw37p2"],
+    "203.0.113.11": ["sw37p1"],
+    "203.0.113.12": ["sw38p1", "sw38p2"]
+  },
+  "credentials": {
+    "203.0.113.10": {
+      "password": "replace-with-password-for-first-switch"
+    },
+    "203.0.113.11": {
+      "username": "admin",
+      "password": "replace-with-password-for-second-switch"
+    }
+  }
+}

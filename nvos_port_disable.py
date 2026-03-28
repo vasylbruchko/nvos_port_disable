@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import requests
 from requests.auth import HTTPBasicAuth
@@ -305,15 +305,54 @@ def parse_targets(
     return targets
 
 
-def load_targets_from_file(filepath: str) -> dict[str, list[str]]:
+def _normalize_per_ip_credentials(raw: Any, context: str) -> dict[str, dict[str, str]]:
+    """Validate and return IP -> {username?, password?} from a JSON object."""
+    if not isinstance(raw, dict):
+        print(f"ERROR: {context} must be a JSON object mapping IPs to credential objects")
+        sys.exit(1)
+    out: dict[str, dict[str, str]] = {}
+    for ip, entry in raw.items():
+        if not isinstance(ip, str) or not ip.strip():
+            print(f"ERROR: {context} has invalid key (expected IP string): {ip!r}")
+            sys.exit(1)
+        if not isinstance(entry, dict):
+            print(
+                f"ERROR: {context} entry for {ip!r} must be an object "
+                '(e.g. {"password": "..."} or {"username": "...", "password": "..."})'
+            )
+            sys.exit(1)
+        row: dict[str, str] = {}
+        if "username" in entry and entry["username"] is not None:
+            row["username"] = str(entry["username"])
+        if "password" in entry and entry["password"] is not None:
+            row["password"] = str(entry["password"])
+        unknown = set(entry.keys()) - {"username", "password"}
+        if unknown:
+            print(
+                f"ERROR: {context} entry for {ip!r} has unknown keys: "
+                f"{', '.join(sorted(unknown))}"
+            )
+            sys.exit(1)
+        out[ip.strip()] = row
+    return out
+
+
+def load_targets_from_file(filepath: str) -> tuple[dict[str, list[str]], dict[str, dict[str, str]]]:
     """
     Load targets from a JSON file with the format:
     {
         "targets": {
             "10.0.0.1": ["sw1p1", "sw1p2"],
             "10.0.0.2": ["sw3p1"]
+        },
+        "credentials": {
+            "10.0.0.1": {"password": "switch-specific-secret"},
+            "10.0.0.2": {"username": "admin", "password": "other-secret"}
         }
     }
+
+    Optional top-level "credentials" maps switch IP to objects with optional
+    "username" and/or "password". Omitted fields fall back to -u / -p on the CLI.
     """
     path = Path(filepath)
     if not path.exists():
@@ -327,7 +366,57 @@ def load_targets_from_file(filepath: str) -> dict[str, list[str]]:
         print("ERROR: JSON file must have a 'targets' key mapping IPs to port lists")
         sys.exit(1)
 
-    return data["targets"]
+    embedded: dict[str, dict[str, str]] = {}
+    if "credentials" in data and data["credentials"] is not None:
+        embedded = _normalize_per_ip_credentials(
+            data["credentials"], f"\"credentials\" in {filepath}"
+        )
+
+    return data["targets"], embedded
+
+
+def load_credentials_file(filepath: str) -> dict[str, dict[str, str]]:
+    """
+    Load per-switch credentials from a JSON file mapping IP to an object, e.g.:
+    {
+        "10.0.0.1": {"password": "secret1"},
+        "10.0.0.2": {"username": "admin2", "password": "secret2"}
+    }
+    """
+    path = Path(filepath)
+    if not path.exists():
+        print(f"ERROR: Credentials file not found: {filepath}")
+        sys.exit(1)
+    with open(path) as f:
+        data = json.load(f)
+    return _normalize_per_ip_credentials(data, filepath)
+
+
+def merge_per_ip_credentials(
+    *maps: dict[str, dict[str, str]],
+) -> dict[str, dict[str, str]]:
+    """Later maps override earlier ones for the same IP."""
+    merged: dict[str, dict[str, str]] = {}
+    for m in maps:
+        for ip, row in m.items():
+            base = dict(merged.get(ip, {}))
+            base.update(row)
+            merged[ip] = base
+    return merged
+
+
+def resolve_switch_auth(
+    ip: str,
+    default_username: str,
+    default_password: str,
+    per_ip: dict[str, dict[str, str]],
+) -> tuple[str, str]:
+    row = per_ip.get(ip, {})
+    username = row.get("username") or default_username
+    password = row.get("password")
+    if password is None or password == "":
+        password = default_password
+    return username, password
 
 
 def process_switch(
@@ -532,6 +621,9 @@ Examples:
   # Use a JSON file for targets
   %(prog)s -u admin -p password -f targets.json
 
+  # Per-switch passwords (JSON map IP -> {password}; -p used for any IP omitted)
+  %(prog)s -u admin -p default_secret -f targets.json -c switch_passwords.json
+
   # Prompt for password
   %(prog)s -u admin -t 10.0.0.1:sw1p1
 
@@ -568,7 +660,15 @@ Examples:
         "--file",
         default=None,
         metavar="FILE",
-        help="JSON file with targets (see README for format)",
+        help="JSON file with targets; optional per-IP 'credentials' object inside the file",
+    )
+    parser.add_argument(
+        "-c",
+        "--credentials-file",
+        default=None,
+        metavar="FILE",
+        help="JSON file mapping each switch IP to {\"password\": \"...\"} and optionally "
+        '"username"; omitted keys use -u / -p. Overrides embedded credentials for the same IP.',
     )
     parser.add_argument(
         "-o",
@@ -627,8 +727,14 @@ Examples:
         password = getpass.getpass(f"Password for {args.username}: ")
 
     targets: dict[str, list[str]] = {}
+    cred_maps: list[dict[str, dict[str, str]]] = []
     if args.file:
-        targets.update(load_targets_from_file(args.file))
+        file_targets, embedded_creds = load_targets_from_file(args.file)
+        targets.update(file_targets)
+        cred_maps.append(embedded_creds)
+    if args.credentials_file:
+        cred_maps.append(load_credentials_file(args.credentials_file))
+    per_ip_credentials = merge_per_ip_credentials(*cred_maps) if cred_maps else {}
     if args.target:
         for ip, ports in parse_targets(
             args.target, allow_ip_only=args.save_only
@@ -681,8 +787,7 @@ Examples:
                 executor.submit(
                     process_switch_save_only,
                     ip,
-                    args.username,
-                    password,
+                    *resolve_switch_auth(ip, args.username, password, per_ip_credentials),
                     args.api_port,
                 ): ip
                 for ip in targets
@@ -693,8 +798,7 @@ Examples:
                     process_switch,
                     ip,
                     ports,
-                    args.username,
-                    password,
+                    *resolve_switch_auth(ip, args.username, password, per_ip_credentials),
                     args.api_port,
                     args.save_config,
                 ): ip
